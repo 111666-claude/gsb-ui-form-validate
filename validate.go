@@ -1,10 +1,9 @@
 // Package formvalidate 是设置面板校验：必填、范围、跨字段规则与错误排序。
-// 缺陷：必填没做、范围端点用开区间、跨字段规则没做、结果按规则表顺序给、解析失败静默跳过、
-// 每条规则扫全部字段。
 package formvalidate
 
 import (
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -37,64 +36,133 @@ type Error struct {
 // Validator 是设置面板校验器。
 type Validator struct {
 	fields  []Field
-	rules   []Rule
+	index   map[string]int
+	rules   map[string][]Rule
 	values  map[string]string
+	set     map[string]bool
+	dirty   bool
+	cached  []Error
 	scanned int
 }
 
 // New 建校验器。
 func New(fields []Field, rules []Rule) (*Validator, error) {
-	known := map[string]bool{}
+	index := map[string]int{}
 	for _, field := range fields {
-		if field.Name == "" || known[field.Name] {
+		if field.Name == "" {
 			return nil, ErrBadSchema
 		}
-		known[field.Name] = true
+		if _, ok := index[field.Name]; ok {
+			return nil, ErrBadSchema
+		}
+		index[field.Name] = len(index)
 	}
 	ids := map[string]bool{}
+	byField := map[string][]Rule{}
 	for _, rule := range rules {
-		if rule.ID == "" || ids[rule.ID] || !known[rule.Field] {
+		if rule.ID == "" || ids[rule.ID] {
+			return nil, ErrBadSchema
+		}
+		if _, ok := index[rule.Field]; !ok {
+			return nil, ErrBadSchema
+		}
+		switch rule.Kind {
+		case "range":
+		case "le", "ge":
+			if _, ok := index[rule.Other]; !ok {
+				return nil, ErrBadSchema
+			}
+		default:
 			return nil, ErrBadSchema
 		}
 		ids[rule.ID] = true
+		byField[rule.Field] = append(byField[rule.Field], rule)
 	}
-	return &Validator{fields: fields, rules: rules, values: map[string]string{}}, nil
+	for _, list := range byField {
+		sort.SliceStable(list, func(i, j int) bool {
+			if list[i].Priority != list[j].Priority {
+				return list[i].Priority < list[j].Priority
+			}
+			return list[i].ID < list[j].ID
+		})
+	}
+	return &Validator{
+		fields: fields,
+		index:  index,
+		rules:  byField,
+		values: map[string]string{},
+		set:    map[string]bool{},
+		dirty:  true,
+	}, nil
 }
 
 // Set 写入一个设置项的值。
 func (v *Validator) Set(name, value string) bool {
-	for _, field := range v.fields {
-		if field.Name == name {
-			v.values[name] = value
-			return true
-		}
+	if _, ok := v.index[name]; !ok {
+		return false
 	}
-	return false
+	v.values[name] = value
+	v.set[name] = true
+	v.dirty = true
+	return true
 }
 
 // Validate 返回当前的校验错误，按字段顺序、规则优先级、规则 ID 升序排列。
+// 表单自上次校验后没有变化时直接返回缓存结果。
 func (v *Validator) Validate() []Error {
+	if !v.dirty {
+		return append([]Error{}, v.cached...)
+	}
 	out := []Error{}
-	for _, rule := range v.rules {
-		for _, field := range v.fields {
+	for _, field := range v.fields {
+		fieldRules := v.rules[field.Name]
+		if !field.Required && len(fieldRules) == 0 {
+			continue
+		}
+		v.scanned++
+		value := strings.TrimSpace(v.values[field.Name])
+		if field.Required && value == "" {
+			out = append(out, Error{Field: field.Name, Rule: "required"})
+			continue
+		}
+		for _, rule := range fieldRules {
 			v.scanned++
-			if field.Name != rule.Field {
-				continue
-			}
-			value := strings.TrimSpace(v.values[field.Name])
-			if rule.Kind != "range" {
-				continue
-			}
-			number, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				continue
-			}
-			if number <= rule.Min || number >= rule.Max {
+			if v.violated(rule, value) {
 				out = append(out, Error{Field: field.Name, Rule: rule.ID})
 			}
 		}
 	}
+	v.cached = append([]Error{}, out...)
+	v.dirty = false
 	return out
+}
+
+// violated 判断一条规则是否对当前值成立（成立即报错）。返回 false 也可能表示规则被跳过。
+func (v *Validator) violated(rule Rule, value string) bool {
+	number, err := strconv.ParseFloat(value, 64)
+	switch rule.Kind {
+	case "range":
+		if err != nil {
+			return true
+		}
+		return number < rule.Min || number > rule.Max
+	case "le", "ge":
+		if err != nil {
+			return true
+		}
+		if !v.set[rule.Other] {
+			return false
+		}
+		other, err := strconv.ParseFloat(strings.TrimSpace(v.values[rule.Other]), 64)
+		if err != nil {
+			return false
+		}
+		if rule.Kind == "le" {
+			return number > other
+		}
+		return number < other
+	}
+	return false
 }
 
 // Scanned 是累计扫描的规则与字段配对数（规模观测）。
